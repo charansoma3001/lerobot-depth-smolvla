@@ -70,6 +70,14 @@ class SmolVLAConfig(PreTrainedConfig):
     train_expert_only: bool = True
     train_state_proj: bool = True
 
+    # C2: auxiliary depth reconstruction. A small head is trained alongside the policy to predict scene depth from the image features, with a combined loss
+    # L_total = L_flow + depth_loss_weight * L_depth. depth_loss_weight is the lambda that trades the two off; 0.0 disables the head entirely,
+    # recovering the plain C1 baseline. The head is discarded at inference, so C1 and C2 cost the same to run.
+    depth_loss_weight: float = 0.0
+    # Edge length (in pixels) of the square depth map the head reconstructs. The target is a 64x64 map, not full resolution, since it is only an
+    # auxiliary training signal.
+    depth_target_size: int = 64
+
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
