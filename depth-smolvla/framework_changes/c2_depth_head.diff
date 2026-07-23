@@ -1,0 +1,205 @@
+# C2 auxiliary depth head - changes to LeRobot's SmolVLA policy
+# Fork base commit: 73dbb6f4
+# Generated with: git diff -- src/lerobot/policies/smolvla/
+
+diff --git a/src/lerobot/policies/smolvla/configuration_smolvla.py b/src/lerobot/policies/smolvla/configuration_smolvla.py
+index 6d5288db..7c9a2978 100644
+--- a/src/lerobot/policies/smolvla/configuration_smolvla.py
++++ b/src/lerobot/policies/smolvla/configuration_smolvla.py
+@@ -70,6 +70,14 @@ class SmolVLAConfig(PreTrainedConfig):
+     train_expert_only: bool = True
+     train_state_proj: bool = True
+ 
++    # C2: auxiliary depth reconstruction. A small head is trained alongside the policy to predict scene depth from the image features, with a combined loss
++    # L_total = L_flow + depth_loss_weight * L_depth. depth_loss_weight is the lambda that trades the two off; 0.0 disables the head entirely,
++    # recovering the plain C1 baseline. The head is discarded at inference, so C1 and C2 cost the same to run.
++    depth_loss_weight: float = 0.0
++    # Edge length (in pixels) of the square depth map the head reconstructs. The target is a 64x64 map, not full resolution, since it is only an
++    # auxiliary training signal.
++    depth_target_size: int = 64
++
+     # Training presets
+     optimizer_lr: float = 1e-4
+     optimizer_betas: tuple[float, float] = (0.9, 0.95)
+diff --git a/src/lerobot/policies/smolvla/modeling_smolvla.py b/src/lerobot/policies/smolvla/modeling_smolvla.py
+index 7f54d03f..6c4c5759 100644
+--- a/src/lerobot/policies/smolvla/modeling_smolvla.py
++++ b/src/lerobot/policies/smolvla/modeling_smolvla.py
+@@ -295,7 +295,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
+         actions = self.prepare_action(batch)
+         actions_is_pad = batch.get("action_is_pad")
+         loss_dict = {}
+-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
++        losses, depth_pred = self.model.forward(
++            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
++        )
++
++        # C2: auxiliary depth loss, the mean squared error between the predicted depth map and the ground-truth one.
++        # depth_pred is None for C1, and even in C2 it is skipped if the batch has no depth target, so C1 behaviour is untouched.
++        depth_loss = None
++        if depth_pred is not None and OBS_DEPTH in batch:
++            depth_gt = batch[OBS_DEPTH].to(dtype=depth_pred.dtype, device=depth_pred.device)
++            depth_loss = F.mse_loss(depth_pred, depth_gt)
++
+         original_action_dim = self.config.action_feature.shape[0]
+         losses = losses[:, :, :original_action_dim]
+         loss_dict["losses_after_forward"] = losses.clone().mean().item()
+@@ -325,6 +335,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
+             else:
+                 num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
+                 loss = losses.sum() / num_valid
++
++            # C2: total loss = flow loss + lambda * depth loss. Both terms are logged so the depth contribution can be tracked during training.
++            loss_dict["flow_loss"] = loss.item()
++            if depth_loss is not None:
++                loss_dict["depth_loss"] = depth_loss.item()
++                loss = loss + self.config.depth_loss_weight * depth_loss
++
+             loss_dict["loss"] = loss.item()
+             return loss, loss_dict
+ 
+@@ -460,6 +477,44 @@ def pad_tensor(tensor, max_len, pad_value=0):
+     return padded_tensor
+ 
+ 
++# Key under which the depth target is stored in the training batch (added by the C2 training script; absent for C1).
++OBS_DEPTH = "observation.depth"
++
++class DepthReconstructionHead(nn.Module):
++    """Auxiliary head that reconstructs a coarse depth map from the image tokens (C2).
++
++    If the same features the policy uses to pick actions can also be decoded back into the scene's depth, then those features must carry 3D spatial
++    information.
++
++    It reads the 64 connector tokens SmolVLA already produces per image. Those tokens are in row-major over an 8x8 grid that covers the
++    (square, top-padded) image, so token t sits at row t // 8, column t % 8. One linear layer maps each token to one depth value, giving an
++    8x8 depth image, which is then bilinearly upsampled to the target resolution (64x64).
++    """
++
++    def __init__(self, hidden_size: int, target_size: int):
++        super().__init__()
++        # One linear layer, shared across all tokens, turning each token into a single depth number.
++        self.proj = nn.Linear(hidden_size, 1)
++        self.target_size = target_size
++
++    def forward(self, image_tokens: Tensor) -> Tensor:
++        # image_tokens: (B, num_tokens, hidden). num_tokens is a perfect square (64), which we reshape back into the 2D grid the tokens came from.
++        bsize, num_tokens, _ = image_tokens.shape
++        grid = int(round(num_tokens**0.5))
++        if grid * grid != num_tokens:
++            raise ValueError(f"Expected a square token grid, got {num_tokens} tokens.")
++        x = self.proj(image_tokens)  # (B, num_tokens, 1): one depth value per token
++        x = x.view(bsize, 1, grid, grid)  # (B, 1, grid, grid): row-major = image layout
++        # Upsample the grid to the target size so it can be compared against the 64x64 depth ground truth pixel for pixel.
++        x = F.interpolate(
++            x.to(dtype=torch.float32),
++            size=(self.target_size, self.target_size),
++            mode="bilinear",
++            align_corners=False,
++        )
++        return x[:, 0]  # (B, target_size, target_size)
++
++
+ class VLAFlowMatching(nn.Module):
+     """
+     SmolVLA
+@@ -515,6 +570,16 @@ class VLAFlowMatching(nn.Module):
+             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
+         )
+ 
++        # C2: auxiliary depth head. Only built when the depth loss is switched on, so the C1 baseline carries no extra parameters.
++        # It reads the connector tokens, whose width is the language model's hidden size.
++        self.depth_head = None
++        if self.config.depth_loss_weight > 0:
++            head_hidden = self.vlm_with_expert.config.text_config.hidden_size
++            self.depth_head = DepthReconstructionHead(
++                hidden_size=head_hidden,
++                target_size=self.config.depth_target_size,
++            )
++
+         self.set_requires_grad()
+         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
+         self.global_image_token = self.vlm_with_expert.processor.tokenizer.global_image_token_id
+@@ -548,13 +613,15 @@ class VLAFlowMatching(nn.Module):
+ 
+     def embed_prefix(
+         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+         """Embed images with SigLIP and language tokens with embedding layer to prepare
+         for SmolVLM transformer processing.
+         """
+         embs = []
+         pad_masks = []
+         att_masks = []
++        # Connector tokens per image, kept aside for the C2 depth head. These are the features before the scaling below, that the head is trained to read.
++        image_embeddings = []
+         for _img_idx, (
+             img,
+             img_mask,
+@@ -575,7 +642,7 @@ class VLAFlowMatching(nn.Module):
+                 pad_masks.append(image_start_mask)
+ 
+             img_emb = self.vlm_with_expert.embed_image(img)
+-            img_emb = img_emb
++            image_embeddings.append(img_emb)
+ 
+             # Normalize image embeddings
+             img_emb_dim = img_emb.shape[-1]
+@@ -638,7 +705,7 @@ class VLAFlowMatching(nn.Module):
+ 
+         att_masks = att_masks.expand(bsize, -1)
+ 
+-        return embs, pad_masks, att_masks
++        return embs, pad_masks, att_masks, image_embeddings
+ 
+     def embed_suffix(self, noisy_actions, timestep):
+         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+@@ -685,8 +752,11 @@ class VLAFlowMatching(nn.Module):
+ 
+     def forward(
+         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+-    ) -> Tensor:
+-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
++    ) -> tuple[Tensor, Tensor | None]:
++        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors).
++
++        Returns the per-element flow-matching losses and, for C2, the predicted depth map.
++        """
+         if noise is None:
+             noise = self.sample_noise(actions.shape, actions.device)
+ 
+@@ -696,7 +766,7 @@ class VLAFlowMatching(nn.Module):
+         time_expanded = time[:, None, None]
+         x_t = time_expanded * noise + (1 - time_expanded) * actions
+         u_t = noise - actions
+-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
++        prefix_embs, prefix_pad_masks, prefix_att_masks, image_embeddings = self.embed_prefix(
+             images, img_masks, lang_tokens, lang_masks, state=state
+         )
+         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+@@ -718,7 +788,13 @@ class VLAFlowMatching(nn.Module):
+         suffix_out = suffix_out.to(dtype=torch.float32)
+         v_t = self.action_out_proj(suffix_out)
+         losses = F.mse_loss(u_t, v_t, reduction="none")
+-        return losses
++
++        # C2: predict a depth map from the first camera's connector tokens. depth_pred is None when the head is disabled (C1)
++        depth_pred = None
++        if self.depth_head is not None and len(image_embeddings) > 0:
++            depth_pred = self.depth_head(image_embeddings[0])
++
++        return losses, depth_pred
+ 
+     def sample_actions(
+         self,
+@@ -738,7 +814,8 @@ class VLAFlowMatching(nn.Module):
+             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+             noise = self.sample_noise(actions_shape, device)
+ 
+-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
++        # At inference the depth head is unused, so the image embeddings are ignored.
++        prefix_embs, prefix_pad_masks, prefix_att_masks, _ = self.embed_prefix(
+             images, img_masks, lang_tokens, lang_masks, state=state
+         )
+         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
